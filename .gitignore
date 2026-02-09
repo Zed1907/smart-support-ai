@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Data
+data/
+*.csv
+
+# HuggingFace / models
+.cache/
+.huggingface/
+
+# VS Code
+.vscode/
+.vscode-server/
+
+# OS
+.DS_Store
