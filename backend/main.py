@@ -12,6 +12,10 @@ import json
 import logging
 import traceback
 import requests
+import os
+
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 from backend.embedder import embed_text
 from backend.endee_client import search, check_connection
@@ -31,6 +35,13 @@ app = FastAPI(
     description="AI-powered ticket assignment & auto-resolution using Endee (RAG)",
     version="1.0.0"
 )
+@app.on_event("startup")
+async def preload_model():
+    """Load embedding model once at startup, not on first request."""
+    logger.info("Preloading embedding model...")
+    from backend.embedder import get_model
+    get_model()
+    logger.info("Embedding model ready.")
 
 # ==================== REQUEST/RESPONSE MODELS ====================
 
@@ -94,41 +105,33 @@ class HealthResponse(BaseModel):
 
 # ==================== UTILITY FUNCTIONS ====================
 
-def call_ollama(prompt: str, timeout: int = 30) -> str:
+def call_ollama(prompt: str, timeout: int = 60) -> str:
     """
-    Safely calls Ollama with timeout protection.
-    
-    Args:
-        prompt: Input prompt for the LLM
-        timeout: Maximum execution time in seconds
-        
-    Returns:
-        LLM response text or error message
+    Calls Ollama via HTTP API (faster than subprocess).
+    Ollama runs as a server on port 11434.
     """
     try:
-        logger.info("Calling Ollama LLM...")
-        result = subprocess.run(
-            ["ollama", "run", "llama3"],
-            input=prompt,
-            text=True,
-            capture_output=True,
+        logger.info("Calling Ollama HTTP API...")
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False,
+            },
             timeout=timeout
         )
-        
-        if result.returncode != 0:
-            logger.error(f"Ollama error: {result.stderr}")
-            return "Error: Failed to generate response"
-        
-        response = result.stdout.strip()
-        logger.info(f"Ollama response length: {len(response)} chars")
-        return response
-        
-    except subprocess.TimeoutExpired:
-        logger.error("Ollama request timed out")
+        response.raise_for_status()
+        result = response.json().get("response", "").strip()
+        logger.info(f"Ollama response length: {len(result)} chars")
+        return result
+
+    except requests.exceptions.Timeout:
+        logger.error("Ollama HTTP request timed out")
         return "Error: Request timed out"
-    except FileNotFoundError:
-        logger.error("Ollama not found in PATH")
-        return "Error: Ollama not installed"
+    except requests.exceptions.ConnectionError:
+        logger.error("Cannot connect to Ollama on port 11434")
+        return "Error: Ollama not reachable"
     except Exception as e:
         logger.error(f"Ollama unexpected error: {str(e)}")
         return f"Error: {str(e)}"
@@ -519,7 +522,7 @@ Example response format:
 Your JSON response:"""
         
         # Call LLM
-        raw_response = call_ollama(prompt, timeout=30)
+        raw_response = call_ollama(prompt, timeout=60)
         
         if raw_response.startswith("Error:"):
             logger.error(f"LLM error: {raw_response}")

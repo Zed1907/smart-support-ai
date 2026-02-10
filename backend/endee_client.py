@@ -219,6 +219,16 @@ def check_connection() -> bool:
         return r.status_code == 200
     except Exception:
         return False
+def get_index_info(index_name: str = INDEX_NAME) -> dict:
+    """
+    Get metadata/info for a specific index.
+    GET /api/v1/index/{name}/info
+    """
+    r = _get_session().get(f"{BASE_URL}/index/{index_name}/info", timeout=5)
+    if r.status_code == 404:
+        raise RuntimeError(f"Index '{index_name}' does not exist. Run: python ingest_tickets.py")
+    r.raise_for_status()
+    return r.json()
 
 
 def invalidate_cache():
