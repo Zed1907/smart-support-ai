@@ -13,6 +13,8 @@ import logging
 import traceback
 import requests
 import os
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -35,6 +37,11 @@ app = FastAPI(
     description="AI-powered ticket assignment & auto-resolution using Endee (RAG)",
     version="1.0.0"
 )
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/ui")
+def serve_ui():
+    return FileResponse("static/index.html")
 @app.on_event("startup")
 async def preload_model():
     """Load embedding model once at startup, not on first request."""
