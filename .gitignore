@@ -1,19 +1,12 @@
-# Python
 venv/
+env/
+.venv/
 __pycache__/
-*.pyc
-
-# Data
-data/
-*.csv
-
-# HuggingFace / models
+*.py[cod]
+*.log
+data/*.csv
 .cache/
-.huggingface/
-
-# VS Code
-.vscode/
-.vscode-server/
-
-# OS
+models/
 .DS_Store
+.env
+endee/
