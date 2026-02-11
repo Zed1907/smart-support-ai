@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
-SmartSupport AI - System Diagnostics
-Run this script to check if all components are properly configured.
+System diagnostics script — verifies all components before running the app.
+
+Checks (in order):
+  0. Python version       — must be 3.8+
+  1. Dependencies         — all pip packages installed
+  2. CSV data file        — cleaned_tickets.csv present and valid
+  3. Endee database       — server running at localhost:8080
+  4. Embedding model      — all-MiniLM-L6-v2 loads and produces vectors
+  5. Vector index         — 'tickets' index exists and returns search results
+  6. Ollama LLM           — optional, needed for /assign-rag and /resolve-rag
+  7. FastAPI server       — optional, checks if uvicorn is already running
+  8. File structure       — all required project files are present
 
 Usage:
-    python test_setup.py [--verbose]
+    python test_setup.py
+    python test_setup.py --verbose   # show debug logs
 """
 
 import sys
@@ -14,517 +25,308 @@ import logging
 import argparse
 from pathlib import Path
 
-# ═══════════════════════════════════════════════════════════════
-# Terminal Colors
-# ═══════════════════════════════════════════════════════════════
 
 class Colors:
-    GREEN = '\033[92m'
-    RED = '\033[91m'
+    GREEN  = '\033[92m'
+    RED    = '\033[91m'
     YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    END = '\033[0m'
+    BLUE   = '\033[94m'
+    CYAN   = '\033[96m'
+    BOLD   = '\033[1m'
+    DIM    = '\033[2m'
+    END    = '\033[0m'
 
-
-# ═══════════════════════════════════════════════════════════════
-# Logging Configuration
-# ═══════════════════════════════════════════════════════════════
-
-def setup_logging(verbose: bool = False):
-    """Configure logging based on verbosity"""
-    level = logging.DEBUG if verbose else logging.ERROR
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-# Print Utilities
-# ═══════════════════════════════════════════════════════════════
 
 def print_header(text):
-    """Print formatted section header"""
-    print(f"\n{Colors.BLUE}{Colors.BOLD}{'═' * 60}{Colors.END}")
-    print(f"{Colors.BLUE}{Colors.BOLD}{text}{Colors.END}")
-    print(f"{Colors.BLUE}{Colors.BOLD}{'═' * 60}{Colors.END}")
+    print(f"\n{Colors.BLUE}{Colors.BOLD}{'═' * 60}\n{text}\n{'═' * 60}{Colors.END}")
+
+def print_success(text): print(f"{Colors.GREEN}✅ {text}{Colors.END}")
+def print_error(text):   print(f"{Colors.RED}❌ {text}{Colors.END}")
+def print_warning(text): print(f"{Colors.YELLOW}⚠️  {text}{Colors.END}")
+def print_info(text, indent=1): print(f"{Colors.DIM}{'   ' * indent}{text}{Colors.END}")
+def print_cmd(text):     print(f"{Colors.CYAN}   $ {text}{Colors.END}")
 
 
-def print_success(text):
-    """Print success message with checkmark"""
-    print(f"{Colors.GREEN}✅ {text}{Colors.END}")
-
-
-def print_error(text):
-    """Print error message with X mark"""
-    print(f"{Colors.RED}❌ {text}{Colors.END}")
-
-
-def print_warning(text):
-    """Print warning message with warning symbol"""
-    print(f"{Colors.YELLOW}⚠️  {text}{Colors.END}")
-
-
-def print_info(text, indent=1):
-    """Print info message with indentation"""
-    spaces = "   " * indent
-    print(f"{Colors.DIM}{spaces}{text}{Colors.END}")
-
-
-def print_command(text):
-    """Print command in monospace style"""
-    print(f"{Colors.CYAN}   $ {text}{Colors.END}")
-
-
-# ═══════════════════════════════════════════════════════════════
-# Test Functions
-# ═══════════════════════════════════════════════════════════════
+# --- Individual Test Functions ---
 
 def test_python_version():
-    """Check Python version"""
-    print_header("0. Python Version Check")
-    
-    version = sys.version_info
-    version_str = f"{version.major}.{version.minor}.{version.micro}"
-    
-    if version.major == 3 and version.minor >= 8:
-        print_success(f"Python {version_str} (compatible)")
+    print_header("0. Python Version")
+    v = sys.version_info
+    if v.major == 3 and v.minor >= 8:
+        print_success(f"Python {v.major}.{v.minor}.{v.micro}")
         return True
-    else:
-        print_error(f"Python {version_str} (requires 3.8+)")
-        print_info("Please upgrade Python to version 3.8 or higher")
-        return False
+    print_error(f"Python {v.major}.{v.minor}.{v.micro} — requires 3.8+")
+    return False
 
 
 def test_dependencies():
-    """Check if required Python packages are installed"""
+    """Check that all required packages can be imported."""
     print_header("1. Python Dependencies")
-    
-    required_packages = {
-        'fastapi': 'fastapi',
-        'uvicorn': 'uvicorn',
-        'pydantic': 'pydantic',
-        'sentence_transformers': 'sentence-transformers',
-        'requests': 'requests',
-        'msgpack': 'msgpack',
-        'orjson': 'orjson',
-        'numpy': 'numpy',
-        'pandas': 'pandas',
-        'tqdm': 'tqdm',
+    packages = {
+        'fastapi': 'fastapi', 'uvicorn': 'uvicorn', 'pydantic': 'pydantic',
+        'sentence_transformers': 'sentence-transformers', 'requests': 'requests',
+        'msgpack': 'msgpack', 'orjson': 'orjson', 'numpy': 'numpy',
+        'pandas': 'pandas', 'tqdm': 'tqdm',
     }
-    
     missing = []
-    installed = []
-    
-    for module, package in required_packages.items():
+    for module, package in packages.items():
         try:
             __import__(module)
-            installed.append(package)
         except ImportError:
             missing.append(package)
-    
+
     if not missing:
-        print_success(f"All {len(installed)} required packages installed")
+        print_success(f"All {len(packages)} packages installed")
         return True
-    else:
-        print_error(f"Missing {len(missing)} required package(s):")
-        for pkg in missing:
-            print_info(f"- {pkg}", indent=2)
-        print_info("\nInstall missing packages with:")
-        print_command("pip install -r requirements.txt")
-        return False
+    print_error(f"Missing: {', '.join(missing)}")
+    print_cmd("pip install -r requirements.txt")
+    return False
 
 
 def test_csv_file():
-    """Check if CSV data file exists"""
-    print_header("2. Data File Check")
-    
+    """Verify the CSV exists and has the correct columns."""
+    print_header("2. Data File")
     csv_path = Path("data/cleaned_tickets.csv")
-    
-    if csv_path.exists():
-        size_mb = csv_path.stat().st_size / (1024 * 1024)
-        print_success(f"CSV file found ({size_mb:.2f} MB)")
-        
-        # Try to read first few lines
-        try:
-            import pandas as pd
-            df = pd.read_csv(csv_path, nrows=5)
-            required_cols = ["ticket_id", "description", "team", "resolution"]
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            
-            if missing_cols:
-                print_warning(f"CSV missing columns: {', '.join(missing_cols)}")
-                return False
-            
-            print_info(f"Found {len(df.columns)} columns: {', '.join(df.columns)}")
-            return True
-        except Exception as e:
-            print_warning(f"Could not validate CSV structure: {e}")
-            return True  # File exists, just can't validate
-    else:
-        print_error("CSV file not found")
-        print_info(f"Expected location: {csv_path.absolute()}")
-        print_info("Create the data directory and add cleaned_tickets.csv")
+    if not csv_path.exists():
+        print_error(f"Not found: {csv_path.absolute()}")
+        print_info("Place cleaned_tickets.csv in the data/ directory")
         return False
+
+    size_mb = csv_path.stat().st_size / (1024 * 1024)
+    print_success(f"CSV found ({size_mb:.2f} MB)")
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path, nrows=5)
+        required = ["ticket_id", "description", "team", "resolution"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print_warning(f"Missing columns: {missing}")
+            return False
+        print_info(f"Columns: {', '.join(df.columns)}")
+    except Exception as e:
+        print_warning(f"Could not validate structure: {e}")
+    return True
 
 
 def test_endee():
-    """Test if Endee vector database is running"""
+    """Check that Endee is running and responsive."""
     print_header("3. Endee Vector Database")
-    
     try:
-        response = requests.get("http://localhost:8080/health", timeout=2)
-        
-        if response.status_code == 200:
-            print_success("Endee is running on port 8080")
-            
-            # Try to list indexes
+        r = requests.get("http://localhost:8080/health", timeout=2)
+        if r.status_code == 200:
+            print_success("Endee running on port 8080")
+            # Also show how many indexes currently exist
             try:
                 from backend.endee_client import list_indexes
-                indexes = list_indexes()
-                if indexes:
-                    print_info(f"Found {len(indexes)} index(es)")
-                else:
-                    print_info("No indexes created yet (run ingest_tickets.py)")
-            except:
+                idxs = list_indexes()
+                print_info(f"{len(idxs)} index(es) found" if idxs else "No indexes yet — run ingest_tickets.py")
+            except Exception:
                 pass
-            
             return True
-        else:
-            print_error(f"Endee returned status {response.status_code}")
-            print_info("Check Endee logs for errors")
-            return False
-            
-    except requests.exceptions.ConnectionError:
-        print_error("Cannot connect to Endee at http://localhost:8080")
-        print_info("\nStart Endee with these commands:")
-        print_command("cd ~/endee")
-        print_command("export NDD_DATA_DIR=$(pwd)/data")
-        print_command("./build/ndd-avx2")
-        print_info("\nOr on macOS with ARM:")
-        print_command("./build/ndd-neon")
+        print_error(f"Endee returned status {r.status_code}")
         return False
-    except Exception as e:
-        print_error(f"Unexpected error: {str(e)}")
+    except requests.exceptions.ConnectionError:
+        print_error("Cannot connect to http://localhost:8080")
+        print_info("Start Endee:")
+        print_cmd("cd ~/endee && export NDD_DATA_DIR=$(pwd)/data && ./build/ndd-avx2")
         return False
 
 
 def test_embedding_model():
-    """Test if embedding model loads and works"""
+    """Load the model and verify it produces vectors of the correct dimension."""
     print_header("4. Embedding Model")
-    
     try:
         from backend.embedder import embed_text, get_embedding_dimension
-        
-        print_info("Loading model (this may take a moment)...")
-        vector = embed_text("test ticket description")
-        
-        expected_dim = get_embedding_dimension()
-        
-        if len(vector) == expected_dim:
-            print_success(f"Embedding model working (all-MiniLM-L6-v2, dim={expected_dim})")
+        print_info("Loading model (may take a few seconds on first run)...")
+        vec = embed_text("test ticket description")
+        dim = get_embedding_dimension()
+        if len(vec) == dim:
+            print_success(f"all-MiniLM-L6-v2 working (dim={dim})")
             return True
-        else:
-            print_error(f"Unexpected vector dimension: {len(vector)} (expected {expected_dim})")
-            return False
-            
-    except ImportError as e:
-        print_error("sentence-transformers package not installed")
-        print_info("Install with:")
-        print_command("pip install sentence-transformers")
+        print_error(f"Unexpected vector size: {len(vec)} (expected {dim})")
         return False
     except Exception as e:
-        print_error(f"Embedding failed: {str(e)}")
-        print_info("Try reinstalling:")
-        print_command("pip install --upgrade sentence-transformers torch")
+        print_error(f"Failed: {e}")
+        print_cmd("pip install sentence-transformers")
         return False
 
 
 def test_vector_index():
-    """Test if vector index exists and has data"""
+    """Verify the 'tickets' index exists and returns results for a test query."""
     print_header("5. Vector Index Data")
-    
     try:
         from backend.embedder import embed_text
         from backend.endee_client import search, get_index_info, INDEX_NAME
-        
-        # Get index info
+
+        # Show index metadata (dimension, count, etc.)
         try:
             info = get_index_info()
-            print_info(f"Index '{INDEX_NAME}' exists")
+            print_info(f"Index '{INDEX_NAME}' found")
             if isinstance(info, dict):
-                for key, value in info.items():
-                    print_info(f"  {key}: {value}", indent=2)
+                for k, v in info.items():
+                    print_info(f"  {k}: {v}", indent=2)
         except Exception as e:
             print_warning(f"Could not get index info: {e}")
-        
-        # Try a search
-        vector = embed_text("payment issue with credit card")
-        result = search(vector, top_k=1)
-        
-        matches = result.get("results") or result.get("vectors") or []
-        
+
+        # Run a test search to confirm data is actually in the index
+        vec = embed_text("payment issue with credit card")
+        matches = search(vec, top_k=1).get("results", [])
+
         if matches:
-            print_success(f"Index has data (found {len(matches)} result)")
-            
-            # Show sample metadata
-            if matches and matches[0].get("metadata"):
-                meta = matches[0]["metadata"]
-                print_info("Sample result:")
-                print_info(f"  Team: {meta.get('team', 'N/A')}", indent=2)
-                print_info(f"  Score: {matches[0].get('score', 'N/A')}", indent=2)
-            
+            print_success(f"Index has data ({len(matches)} result)")
+            meta = matches[0].get("metadata", {})
+            print_info(f"  Team: {meta.get('team', 'N/A')}  Score: {matches[0].get('score', 'N/A')}", indent=2)
             return True
-        else:
-            print_error("Index exists but has no data")
-            print_info("Run data ingestion:")
-            print_command("python ingest_tickets.py")
-            return False
-            
-    except requests.exceptions.ConnectionError:
-        print_error("Cannot connect to Endee (required for index check)")
+
+        print_error("Index is empty — run ingest_tickets.py")
         return False
+
     except RuntimeError as e:
-        if "does not exist" in str(e):
-            print_error("Index 'tickets' does not exist")
-            print_info("Run data ingestion to create index:")
-            print_command("python ingest_tickets.py")
-        else:
-            print_error(f"Index error: {e}")
+        # get_index_info raises a descriptive RuntimeError if index doesn't exist
+        print_error(str(e))
+        print_cmd("python ingest_tickets.py")
         return False
     except Exception as e:
-        print_error(f"Unexpected error: {str(e)}")
+        print_error(f"Unexpected error: {e}")
         return False
 
 
 def test_ollama():
-    """Test if Ollama is running and llama3 is available"""
+    """Check if Ollama is installed and the llama3 model is available."""
     print_header("6. Ollama LLM (Optional)")
-    
     try:
-        # Check if ollama command exists
-        result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True,
-            timeout=5,
-            text=True
-        )
-        
-        if result.returncode == 0:
-            print_success("Ollama is running")
-            
-            # Check for llama3 model
-            if "llama3" in result.stdout.lower():
-                print_success("llama3 model is available")
-                print_info("RAG endpoints will work")
-                return True
-            else:
-                print_warning("llama3 model not found")
-                print_info("Available models:")
-                for line in result.stdout.split('\n')[1:]:  # Skip header
-                    if line.strip():
-                        print_info(f"  - {line.strip()}", indent=2)
-                print_info("\nPull llama3 with:")
-                print_command("ollama pull llama3")
-                return False
-        else:
-            print_error("Ollama command failed")
-            print_info(f"Error: {result.stderr.strip()}")
+        result = subprocess.run(["ollama", "list"], capture_output=True, timeout=5, text=True)
+        if result.returncode != 0:
+            print_error(f"Ollama failed: {result.stderr.strip()}")
             return False
-            
-    except FileNotFoundError:
-        print_warning("Ollama not installed")
-        print_info("Ollama is optional - basic endpoints will still work")
-        print_info("Install from: https://ollama.com/download")
-        print_info("\nWithout Ollama, these endpoints won't work:")
-        print_info("  - /assign-rag", indent=2)
-        print_info("  - /resolve-rag", indent=2)
+        print_success("Ollama running")
+        if "llama3" in result.stdout.lower():
+            print_success("llama3 available — /assign-rag and /resolve-rag will work")
+            return True
+        print_warning("llama3 not found — pull it to enable RAG endpoints")
+        print_cmd("ollama pull llama3")
         return False
-    except subprocess.TimeoutExpired:
-        print_error("Ollama command timed out")
+    except FileNotFoundError:
+        # Ollama isn't installed — non-critical, basic endpoints still work
+        print_warning("Ollama not installed — /assign-rag and /resolve-rag won't work")
+        print_info("Install: https://ollama.com/download")
         return False
     except Exception as e:
-        print_error(f"Ollama error: {str(e)}")
+        print_error(str(e))
         return False
 
 
 def test_api_server():
-    """Test if FastAPI server is running"""
+    """Check if the FastAPI server is already running."""
     print_header("7. FastAPI Server (Optional)")
-    
     try:
-        response = requests.get("http://127.0.0.1:8000/health", timeout=2)
-        
-        if response.status_code in [200, 503]:
-            data = response.json()
-            print_success("API server is running on port 8000")
-            
-            # Show health status
-            print_info("Component status:")
-            for key, value in data.items():
-                status = "✓" if value in [True, "healthy"] else "✗"
-                print_info(f"  {status} {key}: {value}", indent=2)
-            
-            print_info("\nAccess the UI at:")
-            print_info("  http://127.0.0.1:8000/ui", indent=2)
-            print_info("Or API docs at:")
-            print_info("  http://127.0.0.1:8000/docs", indent=2)
+        r = requests.get("http://127.0.0.1:8000/health", timeout=2)
+        if r.status_code in [200, 503]:
+            print_success("API running on port 8000")
+            for k, v in r.json().items():
+                print_info(f"  {'✓' if v in [True, 'healthy'] else '✗'} {k}: {v}", indent=2)
+            print_info("UI:   http://127.0.0.1:8000/ui")
+            print_info("Docs: http://127.0.0.1:8000/docs")
             return True
-        else:
-            print_error(f"API returned status {response.status_code}")
-            return False
-            
-    except requests.exceptions.ConnectionError:
-        print_warning("API server not running")
-        print_info("This is optional - start it when ready with:")
-        print_command("uvicorn backend.main:app --reload")
-        print_info("\nOr for production:")
-        print_command("uvicorn backend.main:app --host 0.0.0.0 --port 8000")
+        print_error(f"API returned {r.status_code}")
         return False
-    except Exception as e:
-        print_error(f"API error: {str(e)}")
+    except requests.exceptions.ConnectionError:
+        print_warning("API not running — start it when ready:")
+        print_cmd("uvicorn backend.main:app --reload")
         return False
 
 
 def test_file_structure():
-    """Verify project file structure"""
+    """Verify all required project files and directories are present."""
     print_header("8. Project Structure")
-    
-    required_files = {
-        "backend/": "Backend module directory",
-        "backend/embedder.py": "Embedding module",
-        "backend/endee_client.py": "Endee client",
-        "backend/main.py": "FastAPI application",
-        "static/": "Static files directory",
-        "static/index.html": "Web UI",
-        "ingest_tickets.py": "Data ingestion script",
-        "requirements.txt": "Python dependencies",
+    required = {
+        "backend/":             "backend package directory",
+        "backend/embedder.py":  "embedding module",
+        "backend/endee_client.py": "Endee HTTP client",
+        "backend/main.py":      "FastAPI application",
+        "static/":              "static files directory",
+        "static/index.html":    "web UI",
+        "ingest_tickets.py":    "data ingestion script",
+        "requirements.txt":     "Python dependencies",
     }
-    
-    missing = []
-    found = []
-    
-    for file_path, description in required_files.items():
-        path = Path(file_path)
-        if path.exists():
-            found.append((file_path, description))
-        else:
-            missing.append((file_path, description))
-    
+    missing = [(p, d) for p, d in required.items() if not Path(p).exists()]
     if not missing:
-        print_success(f"All {len(found)} required files/directories present")
+        print_success(f"All {len(required)} files/directories present")
         return True
-    else:
-        print_error(f"Missing {len(missing)} required file(s):")
-        for file_path, description in missing:
-            print_info(f"- {file_path} ({description})", indent=2)
-        return False
+    print_error(f"Missing {len(missing)} file(s):")
+    for path, desc in missing:
+        print_info(f"- {path} ({desc})", indent=2)
+    return False
 
 
-# ═══════════════════════════════════════════════════════════════
-# Main Test Runner
-# ═══════════════════════════════════════════════════════════════
+# --- Test Runner ---
 
 def main():
-    """Run all diagnostic tests and provide summary"""
-    
-    parser = argparse.ArgumentParser(description='SmartSupport AI System Diagnostics')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser = argparse.ArgumentParser(description='SmartSupport AI Diagnostics')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
-    
-    setup_logging(args.verbose)
-    
-    # Print banner
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.ERROR)
+
     print("\n" + "=" * 60)
     print(f"{Colors.BOLD}{Colors.CYAN}SmartSupport AI - System Diagnostics{Colors.END}")
-    print(f"{Colors.DIM}Checking all components and dependencies{Colors.END}")
     print("=" * 60)
-    
-    # Define test categories
+
+    # critical=True tests must pass for the app to function
+    # critical=False tests are optional features
     tests = [
-        ("Python Version", test_python_version, True),
-        ("Dependencies", test_dependencies, True),
-        ("Data File", test_csv_file, True),
-        ("Endee Database", test_endee, True),
-        ("Embedding Model", test_embedding_model, True),
-        ("Vector Index", test_vector_index, True),
-        ("Ollama LLM", test_ollama, False),  # Optional
-        ("API Server", test_api_server, False),  # Optional
-        ("File Structure", test_file_structure, True),
+        ("Python Version",   test_python_version,   True),
+        ("Dependencies",     test_dependencies,     True),
+        ("Data File",        test_csv_file,         True),
+        ("Endee Database",   test_endee,            True),
+        ("Embedding Model",  test_embedding_model,  True),
+        ("Vector Index",     test_vector_index,     True),
+        ("Ollama LLM",       test_ollama,           False),
+        ("API Server",       test_api_server,       False),
+        ("File Structure",   test_file_structure,   True),
     ]
-    
+
     results = {}
-    
-    # Run all tests
-    for name, test_func, is_critical in tests:
+    for name, fn, critical in tests:
         try:
-            results[name] = {
-                "passed": test_func(),
-                "critical": is_critical
-            }
+            results[name] = {"passed": fn(), "critical": critical}
         except KeyboardInterrupt:
-            print(f"\n\n{Colors.YELLOW}Test interrupted by user{Colors.END}")
+            print(f"\n{Colors.YELLOW}Interrupted{Colors.END}")
             sys.exit(130)
         except Exception as e:
             print_error(f"Test crashed: {e}")
-            results[name] = {
-                "passed": False,
-                "critical": is_critical
-            }
-    
-    # Print summary
+            results[name] = {"passed": False, "critical": critical}
+
+    # Print summary table
     print_header("Summary")
-    
-    critical_passed = 0
-    critical_total = 0
-    optional_passed = 0
-    optional_total = 0
-    
-    for name, result in results.items():
-        status = result["passed"]
-        is_critical = result["critical"]
-        
-        if is_critical:
-            critical_total += 1
-            if status:
-                critical_passed += 1
+    crit_pass = crit_total = opt_pass = opt_total = 0
+
+    for name, r in results.items():
+        if r["critical"]:
+            crit_total += 1
+            if r["passed"]:
+                crit_pass += 1
                 print_success(f"{name} (critical)")
             else:
                 print_error(f"{name} (critical)")
         else:
-            optional_total += 1
-            if status:
-                optional_passed += 1
+            opt_total += 1
+            if r["passed"]:
+                opt_pass += 1
                 print_success(f"{name} (optional)")
             else:
                 print_warning(f"{name} (optional)")
-    
-    # Overall status
-    print(f"\n{Colors.BOLD}Results:{Colors.END}")
-    print(f"  Critical: {critical_passed}/{critical_total} passed")
-    print(f"  Optional: {optional_passed}/{optional_total} passed")
-    
-    print("\n" + "=" * 60)
-    
-    if critical_passed == critical_total:
-        if optional_passed == optional_total:
-            print(f"{Colors.GREEN}{Colors.BOLD}🎉 All systems ready!{Colors.END}")
-            print("\n✨ Next steps:")
-            print_command("uvicorn backend.main:app --reload")
-            print_info("Then visit: http://127.0.0.1:8000/ui")
-            return 0
-        else:
-            print(f"{Colors.YELLOW}{Colors.BOLD}✓ Core systems ready!{Colors.END}")
-            print(f"\n{Colors.DIM}Some optional features are unavailable{Colors.END}")
-            print_info("Basic functionality will work")
-            print_info("RAG endpoints require Ollama")
-            return 0
+
+    print(f"\n{Colors.BOLD}Results: {crit_pass}/{crit_total} critical  |  {opt_pass}/{opt_total} optional{Colors.END}")
+    print("=" * 60)
+
+    if crit_pass == crit_total:
+        label = "🎉 All systems ready!" if opt_pass == opt_total else "✓ Core systems ready!"
+        print(f"{Colors.GREEN}{Colors.BOLD}{label}{Colors.END}")
+        print_cmd("uvicorn backend.main:app --reload")
+        return 0
     else:
-        print(f"{Colors.RED}{Colors.BOLD}❌ Critical components missing{Colors.END}")
-        print(f"\n{Colors.DIM}Fix the failed components above before proceeding{Colors.END}")
+        print(f"{Colors.RED}{Colors.BOLD}❌ Fix the critical failures above before starting the server{Colors.END}")
         return 1
 
 
@@ -532,5 +334,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print(f"\n\n{Colors.YELLOW}Interrupted by user{Colors.END}")
+        print(f"\n{Colors.YELLOW}Interrupted{Colors.END}")
         sys.exit(130)

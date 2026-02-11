@@ -1,10 +1,16 @@
 """
-SmartSupport AI - Main API
-Production-ready FastAPI application for ticket assignment and resolution
+SmartSupport AI — FastAPI backend
+
+Four core endpoints:
+  /assign       — majority vote over retrieved similar tickets
+  /resolve      — returns resolution from the closest matching ticket
+  /assign-rag   — uses an LLM to reason over retrieved tickets and pick a team
+  /resolve-rag  — uses an LLM to generate a tailored resolution
 """
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
 from collections import Counter
 import subprocess
@@ -13,169 +19,123 @@ import logging
 import traceback
 import requests
 import os
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 
+# Prevent sentence-transformers from trying to download models at runtime
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 from backend.embedder import embed_text
 from backend.endee_client import search, check_connection
 
-# ==================== LOGGING SETUP ====================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# ==================== FASTAPI APP ====================
 
 app = FastAPI(
     title="SmartSupport AI",
     description="AI-powered ticket assignment & auto-resolution using Endee (RAG)",
     version="1.0.0"
 )
+
+# Serve the frontend UI from the /static directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/ui")
 def serve_ui():
     return FileResponse("static/index.html")
+
+
 @app.on_event("startup")
 async def preload_model():
-    """Load embedding model once at startup, not on first request."""
-    logger.info("Preloading embedding model...")
+    """
+    Load the embedding model at startup so the first request isn't slow.
+    Without this, the first call to embed_text() would trigger a model load.
+    """
     from backend.embedder import get_model
     get_model()
     logger.info("Embedding model ready.")
 
-# ==================== REQUEST/RESPONSE MODELS ====================
+
+# --- Request / Response Models ---
 
 class TicketRequest(BaseModel):
-    """Request model with validation"""
-    text: str = Field(
-        ...,
-        min_length=10,
-        max_length=5000,
-        description="Ticket description (10-5000 characters)"
-    )
-    top_k: int = Field(
-        default=5,
-        ge=1,
-        le=50,
-        description="Number of similar tickets to retrieve (1-50)"
-    )
-    
+    text: str = Field(..., min_length=10, max_length=5000)
+    top_k: int = Field(default=5, ge=1, le=50)  # How many similar tickets to retrieve
+
     @validator('text')
     def text_not_empty(cls, v):
-        """Ensure text is not just whitespace"""
         if not v.strip():
             raise ValueError('Ticket text cannot be empty or whitespace')
         return v.strip()
 
 
 class AssignResponse(BaseModel):
-    """Response model for ticket assignment"""
     predicted_team: str
-    confidence: float
+    confidence: float       # Fraction of retrieved tickets that agreed on this team (0.0–1.0)
     similar_tickets: int
     status: str = "success"
 
 
 class ResolveResponse(BaseModel):
-    """Response model for ticket resolution"""
     suggested_resolution: str
     status: str = "success"
 
 
 class RAGAssignResponse(BaseModel):
-    """Response model for RAG-based assignment"""
     team: str
-    reason: str
+    reason: str   # LLM's explanation for the team assignment
     status: str = "success"
 
 
 class RAGResolveResponse(BaseModel):
-    """Response model for RAG-based resolution"""
     resolution: str
     status: str = "success"
 
 
 class HealthResponse(BaseModel):
-    """Health check response"""
     api: str
     endee: bool
     ollama: bool
     model: bool
 
 
-# ==================== UTILITY FUNCTIONS ====================
+# --- Helper Functions ---
 
 def call_ollama(prompt: str, timeout: int = 60) -> str:
     """
-    Calls Ollama via HTTP API (faster than subprocess).
-    Ollama runs as a server on port 11434.
+    Send a prompt to the local Ollama server and return the text response.
+    Ollama must be running and have llama3 pulled for RAG endpoints to work.
     """
     try:
-        logger.info("Calling Ollama HTTP API...")
         response = requests.post(
             "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-            },
+            json={"model": "llama3", "prompt": prompt, "stream": False},
             timeout=timeout
         )
         response.raise_for_status()
-        result = response.json().get("response", "").strip()
-        logger.info(f"Ollama response length: {len(result)} chars")
-        return result
-
+        return response.json().get("response", "").strip()
     except requests.exceptions.Timeout:
-        logger.error("Ollama HTTP request timed out")
         return "Error: Request timed out"
     except requests.exceptions.ConnectionError:
-        logger.error("Cannot connect to Ollama on port 11434")
         return "Error: Ollama not reachable"
     except Exception as e:
-        logger.error(f"Ollama unexpected error: {str(e)}")
         return f"Error: {str(e)}"
 
 
 def majority_vote(items):
-    """
-    Returns most common item and its count.
-    
-    Args:
-        items: List of items to vote on
-        
-    Returns:
-        Tuple of (most_common_item, count)
-    """
+    """Return the most common item and how many times it appeared."""
     if not items:
         return None, 0
-    counter = Counter(items)
-    return counter.most_common(1)[0]
+    return Counter(items).most_common(1)[0]
 
 
 def extract_metadata(item):
     """
-    Safely extracts metadata from Endee search results.
-    New SDK format: {"id": str, "score": float, "metadata": {"team": ..., "resolution": ...}}
-
-    Args:
-        item: Search result item
-
-    Returns:
-        Dictionary with team and resolution keys
+    Pull the metadata dict out of a search result.
+    Handles multiple possible field names for robustness.
     """
     if isinstance(item, dict):
-        # New SDK format via our endee_client wrapper
         if "metadata" in item and isinstance(item["metadata"], dict):
             return item["metadata"]
-        # Legacy / fallback formats
         if "payload" in item and isinstance(item["payload"], dict):
             return item["payload"]
         if "meta" in item and isinstance(item["meta"], dict):
@@ -186,471 +146,236 @@ def extract_metadata(item):
 
 def build_context(matches, max_items=5):
     """
-    Builds context text for RAG from retrieved tickets.
-    
-    Args:
-        matches: List of similar tickets from vector search
-        max_items: Maximum number of tickets to include
-        
-    Returns:
-        Formatted context string
+    Format the top search results into a numbered text block.
+    This becomes the 'context' section injected into the LLM prompt.
+    Long resolutions are truncated to keep the prompt a manageable size.
     """
     context = ""
     for i, m in enumerate(matches[:max_items], 1):
         meta = extract_metadata(m)
-        team = meta.get('team', 'Unknown')
         resolution = meta.get('resolution', 'No resolution available')
-        
-        # Truncate long resolutions
         if len(resolution) > 300:
             resolution = resolution[:297] + "..."
-        
-        context += (
-            f"{i}. Team: {team}\n"
-            f"   Resolution: {resolution}\n\n"
-        )
+        context += f"{i}. Team: {meta.get('team', 'Unknown')}\n   Resolution: {resolution}\n\n"
     return context
 
 
 def extract_json_safely(raw: str, default: dict) -> dict:
     """
-    Extracts JSON from LLM response with validation.
-    
-    Args:
-        raw: Raw LLM response text
-        default: Default dict to return on failure
-        
-    Returns:
-        Parsed JSON dict or default
+    Parse JSON from an LLM response, stripping markdown code fences if present.
+    Falls back to `default` if parsing fails or expected keys are missing.
     """
     try:
-        # Remove markdown code blocks if present
         raw = raw.replace("```json", "").replace("```", "")
-        
-        # Find JSON boundaries
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        
+        start, end = raw.find("{"), raw.rfind("}") + 1
         if start == -1 or end == 0:
-            logger.warning("No JSON found in LLM response")
             return default
-        
-        # Extract and parse
-        json_str = raw[start:end]
-        parsed = json.loads(json_str)
-        
-        # Validate expected keys based on default
-        if all(key in parsed for key in default.keys()):
-            return parsed
-        
-        logger.warning(f"JSON missing expected keys: {default.keys()}")
-        return default
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {str(e)}")
-        return default
-    except Exception as e:
-        logger.error(f"Unexpected error extracting JSON: {str(e)}")
+        parsed = json.loads(raw[start:end])
+        # Only accept the response if it contains all the keys we expect
+        return parsed if all(k in parsed for k in default) else default
+    except Exception:
         return default
 
 
-# ==================== HEALTH CHECK ====================
+# --- Endpoints ---
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
-    """
-    Check if all system dependencies are available.
-    Returns 503 if critical services are down.
-    """
-    health = {
-        "api": "healthy",
-        "endee": False,
-        "ollama": False,
-        "model": False
-    }
-    
-    # Check Endee
+    """Check all system components and return their status. Returns 503 if core services are down."""
+    health = {"api": "healthy", "endee": False, "ollama": False, "model": False}
+
     try:
         health["endee"] = check_connection()
-    except:
-        logger.warning("Endee health check failed")
-    
-    # Check Ollama
+    except Exception:
+        pass
+
     try:
-        result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True,
-            timeout=2
-        )
+        result = subprocess.run(["ollama", "list"], capture_output=True, timeout=2)
         health["ollama"] = result.returncode == 0
-    except:
-        logger.warning("Ollama health check failed")
-    
-    # Check embedding model
+    except Exception:
+        pass
+
     try:
         from backend.embedder import get_model
         get_model()
         health["model"] = True
-    except:
-        logger.warning("Embedding model health check failed")
-    
-    # Return 503 if critical services are down
+    except Exception:
+        pass
+
+    # Return 503 if Endee or the embedding model is unavailable
     status = 200 if health["endee"] and health["model"] else 503
-    
     return JSONResponse(content=health, status_code=status)
 
-
-# ==================== CORE ENDPOINTS ====================
 
 @app.post("/assign", response_model=AssignResponse)
 def assign_ticket(req: TicketRequest):
     """
-    Assign ticket to team using vector similarity and majority voting.
-    
-    - Embeds ticket description
-    - Finds K most similar historical tickets
-    - Uses majority vote to predict team
-    - Returns confidence score
+    Assign a ticket to a team using vector similarity + majority voting.
+
+    Steps:
+      1. Embed the ticket text into a 384-dim vector
+      2. Retrieve the top-k most similar historical tickets from Endee
+      3. Collect the team label from each result
+      4. Return the most common team and a confidence score
     """
     try:
-        logger.info(f"Assignment request: {req.text[:100]}...")
-        
-        # Step 1: Generate embedding
-        try:
-            vector = embed_text(req.text)
-            logger.debug(f"Generated vector of length {len(vector)}")
-        except Exception as e:
-            logger.error(f"Embedding failed: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Embedding generation failed: {str(e)}"
-            )
-        
-        # Step 2: Search vector database
-        try:
-            result = search(vector, top_k=req.top_k)
-            logger.debug(f"Search result keys: {result.keys()}")
-        except requests.exceptions.ConnectionError:
-            logger.error("Cannot connect to Endee")
-            raise HTTPException(
-                status_code=503,
-                detail="Vector database unavailable. Please ensure Endee is running."
-            )
-        except Exception as e:
-            logger.error(f"Search failed: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Vector search failed: {str(e)}"
-            )
-        
-        # Step 3: Extract matches
-        matches = result.get("results") or result.get("vectors") or []
-        logger.info(f"Found {len(matches)} similar tickets")
-        
+        # Step 1: Embed
+        vector = embed_text(req.text)
+
+        # Step 2: Search Endee
+        result = search(vector, top_k=req.top_k)
+        matches = result.get("results", [])
+
         if not matches:
-            logger.warning("No similar tickets found")
-            return AssignResponse(
-                predicted_team="Unknown",
-                confidence=0.0,
-                similar_tickets=0,
-                status="no_matches"
-            )
-        
-        # Step 4: Extract teams from matches
-        teams = []
-        for m in matches:
-            meta = extract_metadata(m)
-            if "team" in meta:
-                teams.append(meta["team"])
-        
-        logger.debug(f"Extracted teams: {teams}")
-        
+            return AssignResponse(predicted_team="Unknown", confidence=0.0, similar_tickets=0, status="no_matches")
+
+        # Step 3: Extract team labels from each result
+        teams = [extract_metadata(m).get("team") for m in matches if extract_metadata(m).get("team")]
+
         if not teams:
-            logger.warning("No team labels found in matches")
-            return AssignResponse(
-                predicted_team="Unknown",
-                confidence=0.0,
-                similar_tickets=0,
-                status="no_team_labels"
-            )
-        
-        # Step 5: Majority voting
+            return AssignResponse(predicted_team="Unknown", confidence=0.0, similar_tickets=0, status="no_team_labels")
+
+        # Step 4: Majority vote — confidence = fraction of results that agreed
         team, count = majority_vote(teams)
         confidence = count / len(teams)
-        
-        # Apply confidence threshold
+
+        # Flag low-confidence predictions so agents know to double-check
         if confidence < 0.5:
-            logger.warning(f"Low confidence: {confidence:.2f}")
-            team = "Manual Review"
-            status = "low_confidence"
+            team, status = "Manual Review", "low_confidence"
         else:
             status = "success"
-        
-        logger.info(f"Predicted: {team} (confidence: {confidence:.2f})")
-        
+
         return AssignResponse(
             predicted_team=team,
             confidence=round(confidence, 2),
             similar_tickets=len(teams),
             status=status
         )
-        
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in assign_ticket: {str(e)}")
+    except Exception:
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during ticket assignment"
-        )
+        raise HTTPException(status_code=500, detail="Internal error during ticket assignment")
 
 
 @app.post("/resolve", response_model=ResolveResponse)
 def resolve_ticket(req: TicketRequest):
     """
-    Suggest resolution from most similar historical ticket.
-    
-    - Embeds ticket description
-    - Finds most similar historical ticket
-    - Returns its resolution
+    Suggest a resolution by returning the resolution from the closest matching historical ticket.
+    No LLM involved — fast and deterministic.
     """
     try:
-        logger.info(f"Resolution request: {req.text[:100]}...")
-        
-        # Generate embedding
-        try:
-            vector = embed_text(req.text)
-        except Exception as e:
-            logger.error(f"Embedding failed: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Embedding generation failed: {str(e)}"
-            )
-        
-        # Search vector database
-        try:
-            result = search(vector, top_k=req.top_k)
-        except requests.exceptions.ConnectionError:
-            raise HTTPException(
-                status_code=503,
-                detail="Vector database unavailable"
-            )
-        except Exception as e:
-            logger.error(f"Search failed: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Vector search failed: {str(e)}"
-            )
-        
-        # Extract matches
-        matches = result.get("results") or result.get("vectors") or []
-        
+        vector = embed_text(req.text)
+        result = search(vector, top_k=req.top_k)
+        matches = result.get("results", [])
+
         if not matches:
-            logger.warning("No similar tickets found")
-            return ResolveResponse(
-                suggested_resolution="No similar tickets found in database",
-                status="no_matches"
-            )
-        
-        # Get resolution from best match
-        meta = extract_metadata(matches[0])
-        resolution = meta.get("resolution", "Resolution not available")
-        
-        logger.info(f"Retrieved resolution: {resolution[:100]}...")
-        
-        return ResolveResponse(
-            suggested_resolution=resolution,
-            status="success"
-        )
-        
+            return ResolveResponse(suggested_resolution="No similar tickets found", status="no_matches")
+
+        # Use the top result's resolution as the suggestion
+        resolution = extract_metadata(matches[0]).get("resolution", "Resolution not available")
+        return ResolveResponse(suggested_resolution=resolution, status="success")
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in resolve_ticket: {str(e)}")
+    except Exception:
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during resolution"
-        )
+        raise HTTPException(status_code=500, detail="Internal error during resolution")
 
 
 @app.post("/assign-rag", response_model=RAGAssignResponse)
 def assign_ticket_rag(req: TicketRequest):
     """
-    RAG-based ticket assignment using Endee + Ollama.
-    
-    - Retrieves similar tickets from vector DB
-    - Builds context from historical resolutions
-    - Uses LLM to reason about team assignment
-    - Returns structured JSON response
+    RAG-based assignment: retrieve similar tickets → inject as context → ask LLM which team.
+    More accurate than majority voting for ambiguous tickets but requires Ollama.
     """
     try:
-        logger.info(f"RAG assignment request: {req.text[:100]}...")
-        
-        # Enhanced query for better retrieval
-        enhanced_text = f"Support ticket: {req.text}"
-        vector = embed_text(enhanced_text)
-        
-        # Search for similar tickets
-        result = search(vector, top_k=req.top_k)
-        matches = result.get("results") or result.get("vectors") or []
-        
+        vector = embed_text(f"Support ticket: {req.text}")
+        matches = search(vector, top_k=req.top_k).get("results", [])
+
         if not matches:
-            logger.warning("No similar tickets for RAG")
-            return RAGAssignResponse(
-                team="Unknown",
-                reason="No similar historical tickets found",
-                status="no_matches"
-            )
-        
-        # Build context from matches
+            return RAGAssignResponse(team="Unknown", reason="No similar historical tickets found", status="no_matches")
+
+        # Build the numbered context block from retrieved tickets
         context = build_context(matches)
-        logger.debug(f"Built context: {len(context)} chars")
-        
-        # Construct prompt for LLM
+
         prompt = f"""You are an AI system that assigns customer support tickets to teams.
 
 Here are similar past tickets and how they were handled:
 {context}
-
 New ticket:
 "{req.text}"
 
 Based on the similar tickets above, decide which team should handle this new ticket.
-
-Respond ONLY with valid JSON containing these two keys:
-- "team": The name of the team (e.g., "Billing and Payments", "Technical Support", etc.)
-- "reason": A brief 1-2 sentence explanation
-
-Example response format:
-{{"team": "Technical Support", "reason": "Similar issues with system outages were handled by Technical Support."}}
+Respond ONLY with valid JSON: {{"team": "...", "reason": "..."}}
 
 Your JSON response:"""
-        
-        # Call LLM
-        raw_response = call_ollama(prompt, timeout=60)
-        
-        if raw_response.startswith("Error:"):
-            logger.error(f"LLM error: {raw_response}")
-            return RAGAssignResponse(
-                team="Unknown",
-                reason=raw_response,
-                status="llm_error"
-            )
-        
-        # Parse JSON response
-        parsed = extract_json_safely(
-            raw_response,
-            default={"team": "Unknown", "reason": "Failed to parse LLM response"}
-        )
-        
-        logger.info(f"RAG predicted team: {parsed['team']}")
-        
-        return RAGAssignResponse(
-            team=parsed["team"],
-            reason=parsed["reason"],
-            status="success"
-        )
-        
-    except Exception as e:
-        logger.error(f"Unexpected error in assign_ticket_rag: {str(e)}")
+
+        raw = call_ollama(prompt, timeout=60)
+
+        if raw.startswith("Error:"):
+            return RAGAssignResponse(team="Unknown", reason=raw, status="llm_error")
+
+        parsed = extract_json_safely(raw, {"team": "Unknown", "reason": "Failed to parse LLM response"})
+        return RAGAssignResponse(team=parsed["team"], reason=parsed["reason"], status="success")
+
+    except Exception:
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during RAG assignment"
-        )
+        raise HTTPException(status_code=500, detail="Internal error during RAG assignment")
 
 
 @app.post("/resolve-rag", response_model=RAGResolveResponse)
 def resolve_ticket_rag(req: TicketRequest):
     """
-    RAG-based resolution generation using Endee + Ollama.
-    
-    - Retrieves similar tickets from vector DB
-    - Builds context from historical resolutions
-    - Uses LLM to generate tailored resolution
-    - Returns natural language response
+    RAG-based resolution: retrieve similar tickets → inject as context → ask LLM to write a resolution.
+    Generates a tailored response rather than copying a past resolution verbatim.
     """
     try:
-        logger.info(f"RAG resolution request: {req.text[:100]}...")
-        
-        # Search for similar tickets
         vector = embed_text(req.text)
-        result = search(vector, top_k=req.top_k)
-        matches = result.get("results") or result.get("vectors") or []
-        
+        matches = search(vector, top_k=req.top_k).get("results", [])
+
         if not matches:
-            logger.warning("No similar tickets for RAG resolution")
             return RAGResolveResponse(
-                resolution="No similar past tickets found. Please contact support for assistance.",
+                resolution="No similar tickets found. Please contact support.",
                 status="no_matches"
             )
-        
-        # Build context
-        context = build_context(matches)
-        
-        # Construct prompt
+
         prompt = f"""You are a professional customer support assistant.
 
 Here are past resolutions for similar tickets:
-{context}
-
+{build_context(matches)}
 New ticket:
 "{req.text}"
 
-Based on the similar tickets above, generate a clear, helpful, and professional resolution response for this new ticket. 
-
-Your response should:
-- Address the customer's concern directly
-- Be polite and empathetic
-- Provide actionable steps if applicable
-- Be 2-4 sentences long
+Write a clear, helpful, 2-4 sentence resolution for this ticket.
 
 Resolution:"""
-        
-        # Call LLM
+
         resolution = call_ollama(prompt, timeout=30)
-        
+
         if resolution.startswith("Error:"):
-            logger.error(f"LLM error: {resolution}")
             return RAGResolveResponse(
-                resolution="Unable to generate resolution at this time. Please contact support.",
+                resolution="Unable to generate resolution. Please contact support.",
                 status="llm_error"
             )
-        
-        logger.info(f"Generated resolution: {resolution[:100]}...")
-        
-        return RAGResolveResponse(
-            resolution=resolution,
-            status="success"
-        )
-        
-    except Exception as e:
-        logger.error(f"Unexpected error in resolve_ticket_rag: {str(e)}")
+
+        return RAGResolveResponse(resolution=resolution, status="success")
+
+    except Exception:
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during RAG resolution"
-        )
+        raise HTTPException(status_code=500, detail="Internal error during RAG resolution")
 
-
-# ==================== ROOT ENDPOINT ====================
 
 @app.get("/")
 def root():
-    """Root endpoint with API information"""
     return {
         "name": "SmartSupport AI",
         "version": "1.0.0",
-        "description": "AI-powered ticket assignment & auto-resolution",
         "endpoints": {
-            "health": "/health",
-            "docs": "/docs",
-            "assign": "/assign",
-            "resolve": "/resolve",
-            "assign_rag": "/assign-rag",
-            "resolve_rag": "/resolve-rag"
+            "health": "/health", "docs": "/docs",
+            "assign": "/assign", "resolve": "/resolve",
+            "assign_rag": "/assign-rag", "resolve_rag": "/resolve-rag"
         }
     }
 
